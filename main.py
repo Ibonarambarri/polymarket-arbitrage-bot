@@ -21,6 +21,8 @@ Usage:
   python main.py --spark              # + PySpark parallel processing (scale)
   python main.py --refresh            # Live CLOB prices
   python main.py --min-margin 0.05    # Custom profit threshold
+  python main.py --live               # Continuous scanning (every 60s)
+  python main.py --live --interval 30 # Continuous scanning every 30s
 """
 import argparse
 import json
@@ -47,6 +49,7 @@ from config import (
     LLM_MODEL,
     SPARK_ENABLED,
     SPARK_MIN_MARKETS,
+    DEFAULT_SCAN_INTERVAL,
 )
 from models import ArbitrageOpportunity, ArbitrageType
 from fetcher import PolymarketFetcher
@@ -75,7 +78,7 @@ def c(text: str, color: str) -> str:
     return f"{COLORS.get(color, '')}{text}{COLORS['reset']}"
 
 
-def print_header(use_llm: bool, use_spark: bool):
+def print_header(use_llm: bool, use_spark: bool, live: bool = False):
     print()
     print(c("=" * 70, "cyan"))
     print(c("  POLYMARKET ARBITRAGE SCANNER", "bold"))
@@ -85,6 +88,8 @@ def print_header(use_llm: bool, use_spark: bool):
         modes.append("LLM")
     if use_spark:
         modes.append("Spark")
+    if live:
+        modes.append("LIVE")
     if modes:
         print(c(f"  Mode: {' + '.join(modes)}", "magenta"))
     print(c("=" * 70, "cyan"))
@@ -105,7 +110,7 @@ def print_opportunity(opp: ArbitrageOpportunity, idx: int):
     print(c(f"  Market: ", "bold") + opp.market.question[:80])
     if opp.second_market:
         print(c(f"  Market2: ", "bold") + opp.second_market.question[:80])
-    print(c(f"  Profit/unit: ", "bold") + c(f"${opp.profit_per_dollar:.4f}", "green"))
+    print(c(f"  Profit/unit: ", "bold") + c(f"${abs(opp.profit_per_dollar):.4f}", "green"))
     print(c(f"  Strategy: ", "bold") + opp.strategy)
     print(c(f"  Liquidity: ", "bold") + f"${opp.market.liquidity:,.0f}")
     print(c(f"  Est. max profit: ", "bold") + c(f"${opp.estimated_max_profit_usd:,.2f}", "green"))
@@ -131,6 +136,7 @@ def print_summary(opportunities: list[ArbitrageOpportunity], duration: float):
     print(f"  Total estimated profit potential: {c(f'${total_profit:,.2f}', 'green')}")
     print(f"  Scan duration: {duration:.1f}s")
     print(f"  Timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print(c("  Note: Profits estimated from midpoint prices. Actual execution costs may differ.", "dim"))
     print()
 
 
@@ -208,28 +214,71 @@ def check_ollama(api_base: str, model: str) -> bool:
 
 
 # ------------------------------------------------------------------ #
-#  Main scanner
+#  Opportunity tracker (for live mode)
 # ------------------------------------------------------------------ #
 
-def scan(
-    refresh_prices: bool = False,
-    min_margin: float = MIN_PROFIT_MARGIN,
-    use_llm: bool = False,
-    use_spark: bool = False,
-    llm_api_base: str | None = None,
-    llm_model: str | None = None,
-):
-    logger.info("Starting Polymarket arbitrage scan")
-    logger.info(f"Config: refresh_prices={refresh_prices}, min_margin={min_margin}, use_llm={use_llm}, use_spark={use_spark}")
+class OpportunityTracker:
+    """Tracks arbitrage opportunities across scan cycles to report only new ones."""
 
-    print_header(use_llm, use_spark)
+    def __init__(self):
+        self.seen_keys: set[str] = set()
+        self.last_cycle_keys: set[str] = set()
+        self.total_ever_found: int = 0
 
+    @staticmethod
+    def _make_key(opp: ArbitrageOpportunity) -> str:
+        """Generate a stable key for an opportunity based on type, market, and conditions."""
+        parts = [opp.arb_type.value, opp.market.market_id]
+        parts.extend(sorted(cond.condition_id for cond in opp.conditions_involved))
+        if opp.second_market:
+            parts.append(opp.second_market.market_id)
+        return "|".join(parts)
+
+    def process_cycle(
+        self, opportunities: list[ArbitrageOpportunity]
+    ) -> tuple[list[ArbitrageOpportunity], int]:
+        """Process a scan cycle's results.
+
+        Returns (new_opportunities, disappeared_count).
+        """
+        current_keys: set[str] = set()
+        new_opps: list[ArbitrageOpportunity] = []
+
+        for opp in opportunities:
+            key = self._make_key(opp)
+            current_keys.add(key)
+            if key not in self.seen_keys:
+                new_opps.append(opp)
+
+        disappeared = len(self.last_cycle_keys - current_keys)
+        self.seen_keys.update(current_keys)
+        self.last_cycle_keys = current_keys
+        self.total_ever_found += len(new_opps)
+
+        return new_opps, disappeared
+
+
+# ------------------------------------------------------------------ #
+#  Scanner components
+# ------------------------------------------------------------------ #
+
+def _initialize_components(
+    use_llm: bool,
+    use_spark: bool,
+    llm_api_base: str | None,
+    llm_model: str | None,
+    min_margin: float,
+) -> dict:
+    """Create and initialize all scanner components (fetcher, detector, optional LLM/Spark).
+
+    Returns a dict with keys: fetcher, detector, spark, use_llm (possibly updated).
+    """
     logger.info("Initializing PolymarketFetcher")
     fetcher = PolymarketFetcher()
 
-    # Initialize optional components
     llm_detector = None
     topic_classifier = None
+    effective_use_llm = use_llm
 
     if use_llm:
         print(c("  [0/4] Initializing LLM + embeddings...", "cyan"))
@@ -240,7 +289,7 @@ def scan(
 
         if not check_ollama(api_base, model):
             print(c("         Falling back to heuristic mode.", "yellow"))
-            use_llm = False
+            effective_use_llm = False
         else:
             try:
                 from llm_detector import LLMDependencyDetector
@@ -262,12 +311,44 @@ def scan(
                 print(c(f"         Warning: {e}", "yellow"))
                 print(c("         Install deps: pip install openai sentence-transformers", "yellow"))
                 print(c("         Falling back to heuristic mode.", "yellow"))
+                effective_use_llm = False
 
     detector = ArbitrageDetector(
         min_margin=min_margin,
         llm_detector=llm_detector,
         topic_classifier=topic_classifier,
     )
+
+    spark = None
+    if use_spark:
+        try:
+            from spark_analyzer import SparkArbitrageAnalyzer
+            spark = SparkArbitrageAnalyzer()
+            logger.info("PySpark initialized")
+        except ImportError as e:
+            logger.warning(f"PySpark not available: {e}")
+            print(c("         Warning: pyspark not installed. Using sequential mode.", "yellow"))
+
+    return {
+        "fetcher": fetcher,
+        "detector": detector,
+        "spark": spark,
+        "use_llm": effective_use_llm,
+    }
+
+
+def _run_single_scan(
+    components: dict,
+    refresh_prices: bool,
+    min_margin: float,
+) -> tuple[list[ArbitrageOpportunity], float]:
+    """Execute a single scan cycle: fetch, parse, detect, filter.
+
+    Returns (opportunities, duration_seconds).
+    """
+    fetcher = components["fetcher"]
+    detector = components["detector"]
+    spark = components["spark"]
 
     # 1. Fetch all active events
     print(c("  [1/4] Fetching active events from Polymarket...", "cyan"))
@@ -307,21 +388,13 @@ def scan(
     logger.info("Starting arbitrage detection")
     start = time.time()
 
-    if use_spark and len(all_markets) >= SPARK_MIN_MARKETS:
-        try:
-            from spark_analyzer import SparkArbitrageAnalyzer
-            print(c("         Using PySpark parallel processing...", "magenta"))
-            logger.info(f"Using PySpark parallel processing for {len(all_markets)} markets")
-            spark = SparkArbitrageAnalyzer()
-            opportunities = spark.analyze_parallel(all_markets, detector)
-            spark.stop()
-            logger.info("PySpark analysis completed")
-        except ImportError as e:
-            logger.warning(f"PySpark not available: {e}")
-            print(c("         Warning: pyspark not installed. Using sequential mode.", "yellow"))
-            opportunities = detector.scan_all(all_markets)
+    if spark and len(all_markets) >= SPARK_MIN_MARKETS:
+        print(c("         Using PySpark parallel processing...", "magenta"))
+        logger.info(f"Using PySpark parallel processing for {len(all_markets)} markets")
+        opportunities = spark.analyze_parallel(all_markets, detector)
+        logger.info("PySpark analysis completed")
     else:
-        if use_spark and len(all_markets) < SPARK_MIN_MARKETS:
+        if spark and len(all_markets) < SPARK_MIN_MARKETS:
             print(c(f"         Skipping Spark (<{SPARK_MIN_MARKETS} markets). Using sequential.", "dim"))
             logger.info(f"Market count ({len(all_markets)}) below Spark threshold ({SPARK_MIN_MARKETS}), using sequential mode")
         logger.info(f"Scanning {len(all_markets)} markets sequentially")
@@ -340,21 +413,127 @@ def scan(
     if filtered_count > 0:
         logger.info(f"Filtered out {filtered_count} opportunities below ${MIN_DISPLAY_PROFIT_USD} threshold")
 
-    # Display results
-    if not opportunities:
-        print(c("\n  No arbitrage opportunities found above threshold.", "yellow"))
-        print(f"  (min margin: ${min_margin}, min display: ${MIN_DISPLAY_PROFIT_USD})")
-        logger.info("No arbitrage opportunities found above display threshold")
-    else:
-        print(c(f"\n  Found {len(opportunities)} opportunities!", "green"))
-        logger.info(f"Found {len(opportunities)} arbitrage opportunities above threshold")
-        for idx, opp in enumerate(opportunities):
-            print_opportunity(opp, idx)
-            logger.debug(f"Opportunity #{idx+1}: {opp.arb_type.value} in market {opp.market.market_id}")
+    return opportunities, duration
 
-    print_summary(opportunities, duration)
-    logger.info("Scan completed successfully")
-    return opportunities
+
+# ------------------------------------------------------------------ #
+#  Main scanner (single scan)
+# ------------------------------------------------------------------ #
+
+def scan(
+    refresh_prices: bool = False,
+    min_margin: float = MIN_PROFIT_MARGIN,
+    use_llm: bool = False,
+    use_spark: bool = False,
+    llm_api_base: str | None = None,
+    llm_model: str | None = None,
+):
+    logger.info("Starting Polymarket arbitrage scan")
+    logger.info(f"Config: refresh_prices={refresh_prices}, min_margin={min_margin}, use_llm={use_llm}, use_spark={use_spark}")
+
+    print_header(use_llm, use_spark)
+
+    components = _initialize_components(use_llm, use_spark, llm_api_base, llm_model, min_margin)
+
+    try:
+        opportunities, duration = _run_single_scan(components, refresh_prices, min_margin)
+
+        # Display results
+        if not opportunities:
+            print(c("\n  No arbitrage opportunities found above threshold.", "yellow"))
+            print(f"  (min margin: ${min_margin}, min display: ${MIN_DISPLAY_PROFIT_USD})")
+            logger.info("No arbitrage opportunities found above display threshold")
+        else:
+            print(c(f"\n  Found {len(opportunities)} opportunities!", "green"))
+            logger.info(f"Found {len(opportunities)} arbitrage opportunities above threshold")
+            for idx, opp in enumerate(opportunities):
+                print_opportunity(opp, idx)
+                logger.debug(f"Opportunity #{idx+1}: {opp.arb_type.value} in market {opp.market.market_id}")
+
+        print_summary(opportunities, duration)
+        logger.info("Scan completed successfully")
+        return opportunities
+    finally:
+        if components["spark"]:
+            components["spark"].stop()
+
+
+# ------------------------------------------------------------------ #
+#  Live scanner (continuous mode)
+# ------------------------------------------------------------------ #
+
+def scan_live(
+    refresh_prices: bool = False,
+    min_margin: float = MIN_PROFIT_MARGIN,
+    use_llm: bool = False,
+    use_spark: bool = False,
+    llm_api_base: str | None = None,
+    llm_model: str | None = None,
+    interval: int = DEFAULT_SCAN_INTERVAL,
+):
+    logger.info(f"Starting live scan mode (interval={interval}s)")
+
+    print_header(use_llm, use_spark, live=True)
+    print(c(f"  Scanning every {interval}s. Press Ctrl+C to stop.", "dim"))
+    print()
+
+    components = _initialize_components(use_llm, use_spark, llm_api_base, llm_model, min_margin)
+    tracker = OpportunityTracker()
+    cycle = 0
+
+    try:
+        while True:
+            cycle += 1
+            cycle_start = time.time()
+            timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            print(c(f"\n{'=' * 60}", "cyan"))
+            print(c(f"  CYCLE #{cycle} | {timestamp} UTC", "bold"))
+            print(c(f"{'=' * 60}", "cyan"))
+
+            try:
+                opportunities, duration = _run_single_scan(components, refresh_prices, min_margin)
+            except Exception as exc:
+                logger.error(f"Cycle #{cycle} failed: {exc}", exc_info=True)
+                print(c(f"\n  Cycle #{cycle} error: {exc}", "red"))
+                print(c("  Will retry next cycle.", "yellow"))
+                elapsed = time.time() - cycle_start
+                time.sleep(max(0, interval - elapsed))
+                continue
+
+            new_opps, disappeared = tracker.process_cycle(opportunities)
+
+            if new_opps:
+                print(c(f"\n  {len(new_opps)} NEW opportunity(ies)!", "green"))
+                for idx, opp in enumerate(new_opps):
+                    print_opportunity(opp, idx)
+            else:
+                print(c("\n  No new opportunities this cycle.", "dim"))
+
+            # Cycle summary
+            print(c(f"\n  {'─' * 40}", "dim"))
+            print(f"  Cycle: {c(str(len(opportunities)), 'bold')} total | "
+                  f"{c(str(len(new_opps)), 'green')} new | "
+                  f"{c(str(disappeared), 'yellow')} disappeared")
+            print(f"  All-time unique: {c(str(tracker.total_ever_found), 'bold')} | "
+                  f"Scan: {duration:.1f}s")
+
+            elapsed = time.time() - cycle_start
+            sleep_time = max(0, interval - elapsed)
+            if sleep_time > 0:
+                print(c(f"  Next scan in {sleep_time:.0f}s...", "dim"))
+                time.sleep(sleep_time)
+
+    except KeyboardInterrupt:
+        print(c(f"\n\n{'=' * 60}", "cyan"))
+        print(c("  LIVE MODE STOPPED", "bold"))
+        print(c(f"{'=' * 60}", "cyan"))
+        print(f"  Cycles completed: {cycle}")
+        print(f"  Total unique opportunities found: {c(str(tracker.total_ever_found), 'green')}")
+        print(f"  Last cycle had: {len(tracker.last_cycle_keys)} active opportunities")
+        print()
+    finally:
+        if components["spark"]:
+            components["spark"].stop()
 
 
 # ------------------------------------------------------------------ #
@@ -394,6 +573,14 @@ def main():
         help="LLM model name (overrides config/env)",
     )
     parser.add_argument(
+        "--live", action="store_true",
+        help="Continuous scanning mode (re-scans every --interval seconds)",
+    )
+    parser.add_argument(
+        "--interval", type=int, default=DEFAULT_SCAN_INTERVAL,
+        help=f"Seconds between scans in --live mode (default: {DEFAULT_SCAN_INTERVAL})",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Enable verbose (DEBUG) logging",
     )
@@ -416,15 +603,29 @@ def main():
         datefmt="%H:%M:%S",
     )
 
+    use_llm = not args.no_llm and (args.llm or LLM_ENABLED)
+    use_spark = args.spark or SPARK_ENABLED
+
     try:
-        scan(
-            refresh_prices=args.refresh,
-            min_margin=args.min_margin,
-            use_llm=not args.no_llm and (args.llm or LLM_ENABLED),
-            use_spark=args.spark or SPARK_ENABLED,
-            llm_api_base=args.llm_api_base,
-            llm_model=args.llm_model,
-        )
+        if args.live:
+            scan_live(
+                refresh_prices=args.refresh,
+                min_margin=args.min_margin,
+                use_llm=use_llm,
+                use_spark=use_spark,
+                llm_api_base=args.llm_api_base,
+                llm_model=args.llm_model,
+                interval=args.interval,
+            )
+        else:
+            scan(
+                refresh_prices=args.refresh,
+                min_margin=args.min_margin,
+                use_llm=use_llm,
+                use_spark=use_spark,
+                llm_api_base=args.llm_api_base,
+                llm_model=args.llm_model,
+            )
     except KeyboardInterrupt:
         print(c("\n\n  Scan interrupted by user.", "yellow"))
         sys.exit(0)

@@ -24,7 +24,7 @@ from pyspark.sql.types import (
     ArrayType,
 )
 
-from config import SPARK_MASTER, MIN_PROFIT_MARGIN, MAX_CONDITION_PRICE
+from config import SPARK_MASTER, MIN_PROFIT_MARGIN, MAX_CONDITION_PRICE, ESTIMATED_COST_PER_TRADE
 from models import Market, Condition, Token, ArbitrageOpportunity, ArbitrageType
 
 if TYPE_CHECKING:
@@ -111,7 +111,7 @@ class SparkArbitrageAnalyzer:
 
         df.unpersist()
 
-        all_opportunities.sort(key=lambda o: o.profit_per_dollar, reverse=True)
+        all_opportunities.sort(key=lambda o: abs(o.profit_per_dollar), reverse=True)
         logger.info(f"Spark: found {len(all_opportunities)} total opportunities")
         return all_opportunities
 
@@ -123,28 +123,33 @@ class SparkArbitrageAnalyzer:
         self, df, min_margin: float
     ) -> list[ArbitrageOpportunity]:
         """Check YES + NO != $1 for each condition in parallel."""
+        cost_2 = 2 * ESTIMATED_COST_PER_TRADE
         result_df = (
             df
             .withColumn("spread", F.col("yes_price") + F.col("no_price"))
             .withColumn("deviation", F.abs(F.col("spread") - 1.0))
-            .filter(F.col("deviation") >= min_margin)
+            .withColumn("net", F.col("deviation") - F.lit(cost_2))
+            .filter(F.col("net") >= min_margin)
             .filter(F.col("yes_price") <= MAX_CONDITION_PRICE)
+            .filter(F.col("no_price") <= MAX_CONDITION_PRICE)
         )
 
         opportunities = []
         for row in result_df.collect():
             spread = row.spread
-            profit = abs(spread - 1.0)
+            net = row.net
 
             if spread < 1.0:
+                profit = net  # positive = buy
                 detail = (
                     f"YES={row.yes_price:.4f} + NO={row.no_price:.4f} "
-                    f"= {spread:.4f} < $1.00 | Buy both -> profit ${profit:.4f}/unit"
+                    f"= {spread:.4f} < $1.00 | Buy both -> net profit ${net:.4f}/unit"
                 )
             else:
+                profit = -net  # negative = sell
                 detail = (
                     f"YES={row.yes_price:.4f} + NO={row.no_price:.4f} "
-                    f"= {spread:.4f} > $1.00 | Split & sell -> profit ${profit:.4f}/unit"
+                    f"= {spread:.4f} > $1.00 | Split & sell -> net profit ${net:.4f}/unit"
                 )
 
             market = Market(
@@ -183,11 +188,10 @@ class SparkArbitrageAnalyzer:
         self, df, min_margin: float
     ) -> list[ArbitrageOpportunity]:
         """Check sum(YES) != $1 across conditions in each NegRisk market."""
-        # Only NegRisk markets with uncertain conditions
+        # Only NegRisk markets — use ALL conditions for the sum
         neg_risk_df = (
             df
             .filter(F.col("neg_risk") == True)
-            .filter(F.col("yes_price") <= MAX_CONDITION_PRICE)
         )
 
         # Aggregate per market
@@ -200,26 +204,27 @@ class SparkArbitrageAnalyzer:
             )
             .filter(F.col("n_conditions") >= 2)
             .withColumn("deviation", F.abs(F.col("yes_sum") - 1.0))
-            .filter(F.col("deviation") >= min_margin)
+            .withColumn("net", F.col("deviation") - F.col("n_conditions") * F.lit(ESTIMATED_COST_PER_TRADE))
+            .filter(F.col("net") >= min_margin)
         )
 
         opportunities = []
         for row in market_agg.collect():
             yes_sum = row.yes_sum
-            profit = abs(yes_sum - 1.0)
+            net = row.net
 
             if yes_sum < 1.0:
                 arb_type = ArbitrageType.MARKET_REBALANCING_LONG
                 detail = (
                     f"LONG: sum(YES) = {yes_sum:.4f} < $1.00\n"
-                    f"  Buy 1 YES of each condition -> guaranteed profit ${profit:.4f}/unit\n"
+                    f"  Buy 1 YES of each condition -> net profit ${net:.4f}/unit\n"
                     f"  Conditions: {row.n_conditions}"
                 )
             else:
                 arb_type = ArbitrageType.MARKET_REBALANCING_SHORT
                 detail = (
                     f"SHORT: sum(YES) = {yes_sum:.4f} > $1.00\n"
-                    f"  Buy 1 NO of each condition -> guaranteed profit ${profit:.4f}/unit\n"
+                    f"  Buy 1 NO of each condition -> net profit ${net:.4f}/unit\n"
                     f"  Conditions: {row.n_conditions}"
                 )
 
@@ -235,7 +240,7 @@ class SparkArbitrageAnalyzer:
             opportunities.append(ArbitrageOpportunity(
                 arb_type=arb_type,
                 market=market,
-                profit_per_dollar=profit,
+                profit_per_dollar=net,
                 details=detail,
             ))
 

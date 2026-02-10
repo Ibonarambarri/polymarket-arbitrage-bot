@@ -131,7 +131,7 @@ class LLMDependencyDetector:
         # Independent if |combos| == n * m
         if len(combos) < n * m:
             result.is_dependent = True
-            result.dependent_subsets = self._find_dependent_subsets(combos, n, m)
+            result.dependent_subsets = self._find_equivalent_pairs(combos, n, m)
             logger.debug(
                 f"Dependent pair found: {m1.question[:50]} <-> {m2.question[:50]} "
                 f"({len(combos)} combos vs {n * m} independent)"
@@ -223,31 +223,43 @@ class LLMDependencyDetector:
         return True
 
     @staticmethod
-    def _find_dependent_subsets(
+    def _find_equivalent_pairs(
         combos: list[list[bool]], n: int, m: int
     ) -> list[tuple[list[int], list[int]]]:
         """
-        From valid combinations, find dependent condition subsets.
-        Two conditions are dependent if one being True constrains the
-        other's possible values.
+        From valid combinations, find biconditional equivalent pairs.
+        Only returns pairs where i in M1 and j in M2 always co-occur:
+        i=True => exactly j=True, AND j=True => exactly i=True.
         """
-        deps: list[tuple[list[int], list[int]]] = []
-
-        # For each condition in m1, find which m2 conditions are constrained
+        # m1->m2: for each i, when i=True, which single j is always True?
+        m1_forces_m2: dict[int, int | None] = {}
         for i in range(n):
-            # When m1 condition i is True, which m2 conditions can be True?
-            m2_possible = set()
+            m2_when_i: set[int] = set()
             for combo in combos:
                 if combo[i]:
                     for j in range(n, n + m):
                         if combo[j]:
-                            m2_possible.add(j - n)
+                            m2_when_i.add(j - n)
+            m1_forces_m2[i] = next(iter(m2_when_i)) if len(m2_when_i) == 1 else None
 
-            # If not all m2 conditions are possible, there's a dependency
-            if len(m2_possible) < m:
-                deps.append(([i], list(m2_possible)))
+        # m2->m1: inverse
+        m2_forces_m1: dict[int, int | None] = {}
+        for j in range(m):
+            m1_when_j: set[int] = set()
+            for combo in combos:
+                if combo[n + j]:
+                    for i in range(n):
+                        if combo[i]:
+                            m1_when_j.add(i)
+            m2_forces_m1[j] = next(iter(m1_when_j)) if len(m1_when_j) == 1 else None
 
-        return deps
+        # Only biconditional pairs: i->j AND j->i
+        pairs: list[tuple[list[int], list[int]]] = []
+        for i in range(n):
+            j = m1_forces_m2[i]
+            if j is not None and m2_forces_m1.get(j) == i:
+                pairs.append(([i], [j]))
+        return pairs
 
     # ------------------------------------------------------------------ #
     #  LLM API Call

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 from tqdm import tqdm
 
-from config import MIN_PROFIT_MARGIN, MAX_CONDITION_PRICE, EMBEDDING_SIMILARITY_THRESHOLD
+from config import MIN_PROFIT_MARGIN, MAX_CONDITION_PRICE, EMBEDDING_SIMILARITY_THRESHOLD, ESTIMATED_COST_PER_TRADE
 from models import (
     Market,
     Condition,
@@ -68,21 +68,22 @@ class ArbitrageDetector:
 
             spread = condition.yes_price + condition.no_price
             deviation = abs(spread - 1.0)
+            net = deviation - 2 * ESTIMATED_COST_PER_TRADE
 
-            if deviation < self.min_margin:
+            if net < self.min_margin:
                 continue
 
-            profit = deviation
-
             if spread < 1.0:
+                profit = net  # positive = buy
                 detail = (
                     f"YES={condition.yes_price:.4f} + NO={condition.no_price:.4f} "
-                    f"= {spread:.4f} < $1.00 | Buy both -> profit ${profit:.4f}/unit"
+                    f"= {spread:.4f} < $1.00 | Buy both -> net profit ${net:.4f}/unit"
                 )
             else:
+                profit = -net  # negative = sell
                 detail = (
                     f"YES={condition.yes_price:.4f} + NO={condition.no_price:.4f} "
-                    f"= {spread:.4f} > $1.00 | Split & sell -> profit ${profit:.4f}/unit"
+                    f"= {spread:.4f} > $1.00 | Split & sell -> net profit ${net:.4f}/unit"
                 )
 
             opportunities.append(ArbitrageOpportunity(
@@ -110,44 +111,40 @@ class ArbitrageDetector:
         if not market.is_multi_condition or len(market.conditions) < 2:
             return []
 
-        # Filter to uncertain conditions (paper: ignore conditions > 95%)
-        active_conditions = [c for c in market.conditions if self._is_uncertain(c)]
-        if len(active_conditions) < 2:
-            return []
-
-        yes_sum = sum(c.yes_price for c in active_conditions)
+        all_conditions = market.conditions
+        n_conditions = len(all_conditions)
+        yes_sum = sum(c.yes_price for c in all_conditions)
         deviation = abs(yes_sum - 1.0)
+        net = deviation - n_conditions * ESTIMATED_COST_PER_TRADE
 
-        if deviation < self.min_margin:
+        if net < self.min_margin:
             return []
 
         if yes_sum < 1.0:
-            profit = 1.0 - yes_sum
-            prices_str = " + ".join(f"{c.yes_price:.3f}" for c in active_conditions)
+            prices_str = " + ".join(f"{c.yes_price:.3f}" for c in all_conditions)
             return [ArbitrageOpportunity(
                 arb_type=ArbitrageType.MARKET_REBALANCING_LONG,
                 market=market,
-                profit_per_dollar=profit,
+                profit_per_dollar=net,
                 details=(
                     f"LONG: sum(YES) = {prices_str} = {yes_sum:.4f} < $1.00\n"
-                    f"  Buy 1 YES of each condition -> guaranteed profit ${profit:.4f}/unit\n"
-                    f"  Conditions: {len(active_conditions)}"
+                    f"  Buy 1 YES of each condition -> net profit ${net:.4f}/unit\n"
+                    f"  Conditions: {n_conditions}"
                 ),
-                conditions_involved=active_conditions,
+                conditions_involved=all_conditions,
             )]
         else:
-            profit = yes_sum - 1.0
-            prices_str = " + ".join(f"{c.yes_price:.3f}" for c in active_conditions)
+            prices_str = " + ".join(f"{c.yes_price:.3f}" for c in all_conditions)
             return [ArbitrageOpportunity(
                 arb_type=ArbitrageType.MARKET_REBALANCING_SHORT,
                 market=market,
-                profit_per_dollar=profit,
+                profit_per_dollar=net,
                 details=(
                     f"SHORT: sum(YES) = {prices_str} = {yes_sum:.4f} > $1.00\n"
-                    f"  Buy 1 NO of each condition -> guaranteed profit ${profit:.4f}/unit\n"
-                    f"  Conditions: {len(active_conditions)}"
+                    f"  Buy 1 NO of each condition -> net profit ${net:.4f}/unit\n"
+                    f"  Conditions: {n_conditions}"
                 ),
-                conditions_involved=active_conditions,
+                conditions_involved=all_conditions,
             )]
 
     # ================================================================== #
@@ -283,27 +280,28 @@ class ArbitrageDetector:
                 continue
 
             price_diff = abs(c1.yes_price - c2.yes_price)
-            if price_diff < self.min_margin:
+            net = price_diff - 2 * ESTIMATED_COST_PER_TRADE
+            if net < self.min_margin:
                 continue
 
             if c1.yes_price < c2.yes_price:
                 detail = (
                     f"M1 '{c1.question}' YES={c1.yes_price:.4f} vs "
                     f"M2 '{c2.question}' YES={c2.yes_price:.4f}\n"
-                    f"  Buy YES in M1, buy NO in M2 -> profit ${price_diff:.4f}/unit"
+                    f"  Buy YES in M1, buy NO in M2 -> net profit ${net:.4f}/unit"
                 )
             else:
                 detail = (
                     f"M1 '{c1.question}' YES={c1.yes_price:.4f} vs "
                     f"M2 '{c2.question}' YES={c2.yes_price:.4f}\n"
-                    f"  Buy NO in M1, buy YES in M2 -> profit ${price_diff:.4f}/unit"
+                    f"  Buy NO in M1, buy YES in M2 -> net profit ${net:.4f}/unit"
                 )
 
             opportunities.append(ArbitrageOpportunity(
                 arb_type=ArbitrageType.COMBINATORIAL,
                 market=market1,
                 second_market=market2,
-                profit_per_dollar=price_diff,
+                profit_per_dollar=net,
                 details=detail,
                 conditions_involved=[c1, c2],
             ))
@@ -351,7 +349,7 @@ class ArbitrageDetector:
 
         # Sort by profit descending
         logger.info(f"Total opportunities found: {len(all_opps)}")
-        all_opps.sort(key=lambda o: o.profit_per_dollar, reverse=True)
+        all_opps.sort(key=lambda o: abs(o.profit_per_dollar), reverse=True)
         return all_opps
 
     # ================================================================== #
@@ -359,8 +357,9 @@ class ArbitrageDetector:
     # ================================================================== #
 
     def _is_uncertain(self, condition: Condition) -> bool:
-        """Paper Section 6: only analyze when no position > MAX_CONDITION_PRICE."""
-        return condition.yes_price <= MAX_CONDITION_PRICE
+        """Paper Section 6: only analyze when neither side > MAX_CONDITION_PRICE."""
+        return (condition.yes_price <= MAX_CONDITION_PRICE and
+                condition.no_price <= MAX_CONDITION_PRICE)
 
     @staticmethod
     def _group_by_date(markets: list[Market]) -> dict[str, list[Market]]:
@@ -391,6 +390,6 @@ class ArbitrageDetector:
                 sim = SequenceMatcher(
                     None, c1.question.lower(), c2.question.lower()
                 ).ratio()
-                if sim > 0.6:
+                if sim > 0.85:
                     deps.append((c1, c2))
         return deps

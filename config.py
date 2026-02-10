@@ -31,8 +31,17 @@ TOPICS = ["Politics", "Economy", "Technology", "Crypto", "Twitter", "Culture", "
 MARKETS_PER_PAGE = 100
 API_DELAY = 0.1
 
+# --- Trading Costs ---
+# Estimated cost per trade (taker fee + bid-ask spread crossing)
+# Polymarket: ~0% maker, ~1-2% taker + spread. Conservative estimate.
+ESTIMATED_COST_PER_TRADE = 0.01
+
 # --- Position Sizing ---
 MAX_POSITION_SIZE = 10000.0
+
+# Fraction of displayed liquidity assumed executable at current prices
+# Real order books have depth << total liquidity
+EXECUTABLE_LIQUIDITY_FACTOR = 0.05
 
 # --- Display ---
 MIN_DISPLAY_PROFIT_USD = 1.0
@@ -61,3 +70,6 @@ EMBEDDING_SIMILARITY_THRESHOLD = 0.7  # Min similarity to check pair with LLM
 SPARK_ENABLED = True
 SPARK_MASTER = "local[*]"  # Or "spark://host:port" for cluster
 SPARK_MIN_MARKETS = 100  # Only use Spark above this threshold
+
+# --- Live Scanning ---
+DEFAULT_SCAN_INTERVAL = 60
