@@ -259,7 +259,7 @@ def scan(
         logger.info(f"Found {len(opportunities)} arbitrage opportunities above threshold")
         for idx, opp in enumerate(opportunities):
             print_opportunity(opp, idx)
-            logger.debug(f"Opportunity #{idx+1}: {opp.arb_type.value} in market {opp.market.event_id}")
+            logger.debug(f"Opportunity #{idx+1}: {opp.arb_type.value} in market {opp.market.market_id}")
 
     print_summary(opportunities, duration)
     logger.info("Scan completed successfully")

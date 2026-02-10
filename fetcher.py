@@ -57,7 +57,7 @@ class PolymarketFetcher:
                 break
             all_events.extend(batch)
             offset += len(batch)
-            logger.info(f"Fetched page {page}: {len(batch)} events (total: {len(all_events)})")
+            logger.debug(f"Fetched page {page}: {len(batch)} events (total: {len(all_events)})")
             page += 1
             time.sleep(API_DELAY)
         logger.info(f"Completed fetching {len(all_events)} events in {page-1} pages")

@@ -132,7 +132,7 @@ class LLMDependencyDetector:
         if len(combos) < n * m:
             result.is_dependent = True
             result.dependent_subsets = self._find_dependent_subsets(combos, n, m)
-            logger.info(
+            logger.debug(
                 f"Dependent pair found: {m1.question[:50]} <-> {m2.question[:50]} "
                 f"({len(combos)} combos vs {n * m} independent)"
             )
@@ -161,6 +161,7 @@ class LLMDependencyDetector:
 
         # Create "Other" catch-all condition
         other_yes = sum(c.yes_price for c in sorted_conds[MAX_CONDITIONS_PER_MARKET:])
+        other_yes = min(other_yes, 1.0)
         other = Condition(
             condition_id="other",
             question="None of the above",

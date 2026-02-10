@@ -38,15 +38,16 @@ class ArbitrageDetector:
         llm_detector: LLMDependencyDetector | None = None,
         topic_classifier: TopicClassifier | None = None,
     ):
-        logger.info("Initializing ArbitrageDetector")
         self.min_margin = min_margin
         self.llm_detector = llm_detector
         self.topic_classifier = topic_classifier
         self._checked_pairs: set[tuple[str, str]] = set()
 
-        logger.info(f"Min profit margin: {min_margin}")
-        logger.info(f"LLM detector: {'enabled' if llm_detector else 'disabled'}")
-        logger.info(f"Topic classifier: {'enabled' if topic_classifier else 'disabled'}")
+        logger.info(
+            f"ArbitrageDetector initialized (margin={min_margin}, "
+            f"llm={'on' if llm_detector else 'off'}, "
+            f"embeddings={'on' if topic_classifier else 'off'})"
+        )
 
     # ================================================================== #
     #  1. Single Condition Arbitrage (Section 6.1)
@@ -69,14 +70,14 @@ class ArbitrageDetector:
             if deviation < self.min_margin:
                 continue
 
+            profit = deviation
+
             if spread < 1.0:
-                profit = 1.0 - spread
                 detail = (
                     f"YES={condition.yes_price:.4f} + NO={condition.no_price:.4f} "
                     f"= {spread:.4f} < $1.00 | Buy both -> profit ${profit:.4f}/unit"
                 )
             else:
-                profit = spread - 1.0
                 detail = (
                     f"YES={condition.yes_price:.4f} + NO={condition.no_price:.4f} "
                     f"= {spread:.4f} > $1.00 | Split & sell -> profit ${profit:.4f}/unit"
@@ -207,7 +208,6 @@ class ArbitrageDetector:
                         m1, m2, similarity_threshold
                     )
                     if dep_conditions:
-                        logger.info(f"  Found dependent pair: {len(dep_conditions)} condition pairs")
                         pairs.append((m1, m2, dep_conditions))
 
         logger.info(f"Checked {total_pairs_checked} market pairs, found {len(pairs)} dependent pairs")
@@ -246,9 +246,9 @@ class ArbitrageDetector:
     ) -> list[tuple[Condition, Condition]]:
         """Extract dependent condition pairs from LLM dependency result."""
         deps = []
+        conds_m1 = self.llm_detector._reduce_conditions(m1)
+        conds_m2 = self.llm_detector._reduce_conditions(m2)
         for m1_indices, m2_indices in result.dependent_subsets:
-            conds_m1 = self.llm_detector._reduce_conditions(m1)
-            conds_m2 = self.llm_detector._reduce_conditions(m2)
             for i in m1_indices:
                 if i < len(conds_m1):
                     for j in m2_indices:
