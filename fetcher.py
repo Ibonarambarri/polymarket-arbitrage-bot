@@ -16,8 +16,11 @@ class PolymarketFetcher:
     """Fetches market data from Polymarket APIs (no auth needed for read-only)."""
 
     def __init__(self):
+        logger.info("Initializing PolymarketFetcher")
         self.session = requests.Session()
         self.session.headers.update({"Accept": "application/json"})
+        logger.debug(f"CLOB API: {CLOB_BASE_URL}")
+        logger.debug(f"Gamma API: {GAMMA_BASE_URL}")
 
     # ------------------------------------------------------------------ #
     #  Gamma API - Market Discovery
@@ -37,9 +40,12 @@ class PolymarketFetcher:
 
     def get_all_active_events(self) -> list[dict]:
         """Paginate through all active, non-closed events."""
+        logger.info("Starting pagination of active events from Gamma API")
         all_events = []
         offset = 0
+        page = 1
         while True:
+            logger.debug(f"Fetching page {page} (offset={offset}, limit={MARKETS_PER_PAGE})")
             batch = self.get_events(
                 limit=MARKETS_PER_PAGE,
                 offset=offset,
@@ -47,11 +53,14 @@ class PolymarketFetcher:
                 closed="false",
             )
             if not batch:
+                logger.debug("No more events to fetch (empty batch)")
                 break
             all_events.extend(batch)
             offset += len(batch)
-            logger.info(f"Fetched {len(all_events)} events...")
+            logger.info(f"Fetched page {page}: {len(batch)} events (total: {len(all_events)})")
+            page += 1
             time.sleep(API_DELAY)
+        logger.info(f"Completed fetching {len(all_events)} events in {page-1} pages")
         return all_events
 
     # ------------------------------------------------------------------ #
@@ -181,14 +190,20 @@ class PolymarketFetcher:
 
     def refresh_prices(self, market: Market) -> Market:
         """Refresh live prices from CLOB for all tokens in a market."""
+        logger.debug(f"Refreshing prices for market: {market.market_id} ({len(market.conditions)} conditions)")
+        tokens_refreshed = 0
         for condition in market.conditions:
             for token in condition.tokens:
                 if not token.token_id:
                     continue
                 mid = self.get_midpoint(token.token_id)
                 if mid is not None:
+                    old_price = token.price
                     token.price = mid
+                    tokens_refreshed += 1
+                    logger.debug(f"  Token {token.outcome}: {old_price:.4f} -> {mid:.4f}")
                 time.sleep(API_DELAY)
+        logger.debug(f"Refreshed {tokens_refreshed} token prices for market {market.market_id}")
         return market
 
     # ------------------------------------------------------------------ #
@@ -197,9 +212,12 @@ class PolymarketFetcher:
 
     def _get(self, url: str, params: dict = None) -> dict | list | None:
         try:
+            logger.debug(f"GET {url} {params or {}}")
             resp = self.session.get(url, params=params, timeout=15)
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            logger.debug(f"  -> {resp.status_code} OK ({len(str(data))} bytes)")
+            return data
         except requests.RequestException as e:
             logger.warning(f"API request failed: {url} - {e}")
             return None

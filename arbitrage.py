@@ -38,10 +38,15 @@ class ArbitrageDetector:
         llm_detector: LLMDependencyDetector | None = None,
         topic_classifier: TopicClassifier | None = None,
     ):
+        logger.info("Initializing ArbitrageDetector")
         self.min_margin = min_margin
         self.llm_detector = llm_detector
         self.topic_classifier = topic_classifier
         self._checked_pairs: set[tuple[str, str]] = set()
+
+        logger.info(f"Min profit margin: {min_margin}")
+        logger.info(f"LLM detector: {'enabled' if llm_detector else 'disabled'}")
+        logger.info(f"Topic classifier: {'enabled' if topic_classifier else 'disabled'}")
 
     # ================================================================== #
     #  1. Single Condition Arbitrage (Section 6.1)
@@ -157,18 +162,26 @@ class ArbitrageDetector:
         2. Embedding-based: topic + semantic similarity pre-filtering
         3. Heuristic fallback: text similarity with SequenceMatcher
         """
+        logger.info("Starting dependent pair detection")
         pairs = []
         self._checked_pairs.clear()
 
         # Group markets by (topic, date) or just by date
         if self.topic_classifier:
+            logger.info("Grouping markets by topic and date using embeddings")
             groups = self.topic_classifier.group_by_topic_and_date(markets)
         else:
+            logger.info("Grouping markets by date (no topic classifier)")
             groups = self._group_by_date(markets)
+
+        logger.info(f"Created {len(groups)} groups")
+        total_pairs_checked = 0
 
         for group_key, group in groups.items():
             if len(group) < 2:
                 continue
+
+            logger.debug(f"Checking group '{group_key}' with {len(group)} markets")
 
             for i in range(len(group)):
                 for j in range(i + 1, len(group)):
@@ -180,11 +193,13 @@ class ArbitrageDetector:
                     if pair_key in self._checked_pairs:
                         continue
                     self._checked_pairs.add(pair_key)
+                    total_pairs_checked += 1
 
                     # Pre-filter: embedding similarity (if available)
                     if self.topic_classifier:
                         sim = self.topic_classifier.compute_similarity(m1, m2)
                         if sim < EMBEDDING_SIMILARITY_THRESHOLD:
+                            logger.debug(f"  Skipping pair (embedding sim={sim:.3f} < {EMBEDDING_SIMILARITY_THRESHOLD})")
                             continue
 
                     # Check dependency: LLM or heuristic
@@ -192,9 +207,10 @@ class ArbitrageDetector:
                         m1, m2, similarity_threshold
                     )
                     if dep_conditions:
+                        logger.info(f"  Found dependent pair: {len(dep_conditions)} condition pairs")
                         pairs.append((m1, m2, dep_conditions))
 
-        logger.info(f"Found {len(pairs)} dependent market pairs")
+        logger.info(f"Checked {total_pairs_checked} market pairs, found {len(pairs)} dependent pairs")
         return pairs
 
     def _check_pair_dependency(
@@ -209,15 +225,20 @@ class ArbitrageDetector:
         """
         # Mode 1: LLM-based dependency detection (paper Section 5.2)
         if self.llm_detector:
+            logger.debug(f"  Checking dependency with LLM: '{m1.question[:50]}...' vs '{m2.question[:50]}...'")
             result = self.llm_detector.check_market_pair(m1, m2)
             if result.is_dependent:
+                logger.debug(f"    LLM detected dependency")
                 return self._extract_conditions_from_llm(result, m1, m2)
+            logger.debug(f"    LLM: not dependent")
             return []
 
         # Mode 2: Heuristic fallback
         sim = self._text_similarity(m1.question, m2.question)
+        logger.debug(f"  Checking dependency with heuristic: text_sim={sim:.3f}")
         if sim < similarity_threshold:
             return []
+        logger.debug(f"    Heuristic detected dependency (sim={sim:.3f} >= {similarity_threshold})")
         return self._find_dependent_conditions_heuristic(m1, m2)
 
     def _extract_conditions_from_llm(
@@ -287,23 +308,41 @@ class ArbitrageDetector:
 
     def scan_all(self, markets: list[Market]) -> list[ArbitrageOpportunity]:
         """Run all arbitrage checks on a list of markets."""
+        logger.info(f"Starting full arbitrage scan on {len(markets)} markets")
         all_opps: list[ArbitrageOpportunity] = []
 
         # 1. Single condition arbitrage
+        logger.info(f"[1/3] Checking single condition arbitrage on {len(markets)} markets")
+        single_cond_opps = 0
         for market in markets:
-            all_opps.extend(self.check_single_condition(market))
+            opps = self.check_single_condition(market)
+            all_opps.extend(opps)
+            single_cond_opps += len(opps)
+        logger.info(f"  Found {single_cond_opps} single condition opportunities")
 
         # 2. Market rebalancing (NegRisk markets)
         neg_risk_markets = [m for m in markets if m.is_multi_condition]
+        logger.info(f"[2/3] Checking market rebalancing on {len(neg_risk_markets)} NegRisk markets")
+        rebal_opps = 0
         for market in neg_risk_markets:
-            all_opps.extend(self.check_market_rebalancing(market))
+            opps = self.check_market_rebalancing(market)
+            all_opps.extend(opps)
+            rebal_opps += len(opps)
+        logger.info(f"  Found {rebal_opps} market rebalancing opportunities")
 
         # 3. Combinatorial arbitrage between dependent markets
+        logger.info(f"[3/3] Finding dependent market pairs from {len(markets)} markets")
         pairs = self.find_dependent_pairs(markets)
+        logger.info(f"  Checking combinatorial arbitrage on {len(pairs)} dependent pairs")
+        comb_opps = 0
         for m1, m2, deps in pairs:
-            all_opps.extend(self.check_combinatorial_arbitrage(m1, m2, deps))
+            opps = self.check_combinatorial_arbitrage(m1, m2, deps)
+            all_opps.extend(opps)
+            comb_opps += len(opps)
+        logger.info(f"  Found {comb_opps} combinatorial opportunities")
 
         # Sort by profit descending
+        logger.info(f"Total opportunities found: {len(all_opps)}")
         all_opps.sort(key=lambda o: o.profit_per_dollar, reverse=True)
         return all_opps
 

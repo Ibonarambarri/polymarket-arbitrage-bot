@@ -24,6 +24,7 @@ import logging
 import sys
 import time
 from datetime import datetime, timezone
+from tqdm import tqdm
 
 from config import (
     MIN_PROFIT_MARGIN,
@@ -38,6 +39,9 @@ from config import (
 from models import ArbitrageOpportunity, ArbitrageType
 from fetcher import PolymarketFetcher
 from arbitrage import ArbitrageDetector
+
+# Module logger
+logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------ #
 #  Display helpers
@@ -130,8 +134,12 @@ def scan(
     llm_api_base: str | None = None,
     llm_model: str | None = None,
 ):
+    logger.info("Starting Polymarket arbitrage scan")
+    logger.info(f"Config: refresh_prices={refresh_prices}, min_margin={min_margin}, use_llm={use_llm}, use_spark={use_spark}")
+
     print_header(use_llm, use_spark)
 
+    logger.info("Initializing PolymarketFetcher")
     fetcher = PolymarketFetcher()
 
     # Initialize optional components
@@ -140,6 +148,7 @@ def scan(
 
     if use_llm:
         print(c("  [0/4] Initializing LLM + embeddings...", "cyan"))
+        logger.info("Initializing LLM-based dependency detection")
         try:
             from llm_detector import LLMDependencyDetector
             from embeddings import TopicClassifier
@@ -147,15 +156,19 @@ def scan(
             api_base = llm_api_base or LLM_API_BASE_URL
             model = llm_model or LLM_MODEL
 
+            logger.info(f"Connecting to LLM API: {api_base}, model: {model}")
             llm_detector = LLMDependencyDetector(
                 api_base_url=api_base,
                 api_key=LLM_API_KEY,
                 model_name=model,
             )
+            logger.info("Loading topic classifier embeddings")
             topic_classifier = TopicClassifier()
             print(f"         LLM: {model} @ {api_base}")
             print(f"         Embeddings: loaded")
+            logger.info("LLM initialization completed successfully")
         except ImportError as e:
+            logger.warning(f"LLM dependencies not available: {e}")
             print(c(f"         Warning: {e}. Install deps: pip install openai sentence-transformers", "yellow"))
             print(c("         Falling back to heuristic mode.", "yellow"))
 
@@ -167,69 +180,89 @@ def scan(
 
     # 1. Fetch all active events
     print(c("  [1/4] Fetching active events from Polymarket...", "cyan"))
+    logger.info("Fetching active events from Polymarket Gamma API")
     events = fetcher.get_all_active_events()
+    logger.info(f"Successfully fetched {len(events)} active events")
     print(f"         Found {len(events)} active events")
 
     # 2. Parse into Market objects
     print(c("  [2/4] Parsing markets and conditions...", "cyan"))
+    logger.info(f"Parsing {len(events)} events into Market objects")
     all_markets = []
-    for event in events:
+    for event in tqdm(events, desc="         Parsing events", unit="event", leave=False, disable=None):
         markets = fetcher.parse_event_to_markets(event)
         all_markets.extend(markets)
 
     neg_risk_count = sum(1 for m in all_markets if m.is_multi_condition)
     single_count = len(all_markets) - neg_risk_count
     total_conditions = sum(len(m.conditions) for m in all_markets)
+    logger.info(f"Parsed {len(all_markets)} markets: {neg_risk_count} NegRisk, {single_count} single, {total_conditions} total conditions")
     print(f"         {len(all_markets)} markets ({neg_risk_count} NegRisk, {single_count} single)")
     print(f"         {total_conditions} total conditions")
 
     # 3. Optionally refresh prices
     if refresh_prices:
         print(c("  [3/4] Refreshing live prices from CLOB API...", "cyan"))
-        for i, market in enumerate(all_markets):
+        logger.info(f"Refreshing live prices for {len(all_markets)} markets from CLOB API")
+        for market in tqdm(all_markets, desc="         Refreshing prices", unit="market", leave=False, disable=None):
             fetcher.refresh_prices(market)
-            if (i + 1) % 10 == 0:
-                print(f"         Refreshed {i + 1}/{len(all_markets)} markets...")
+        logger.info("Price refresh completed")
     else:
         print(c("  [3/4] Using Gamma API prices (use --refresh for live CLOB prices)", "dim"))
+        logger.info("Using Gamma API prices (no refresh)")
 
     # 4. Detect arbitrage
     print(c("  [4/4] Scanning for arbitrage opportunities...", "cyan"))
+    logger.info("Starting arbitrage detection")
     start = time.time()
 
     if use_spark and len(all_markets) >= SPARK_MIN_MARKETS:
         try:
             from spark_analyzer import SparkArbitrageAnalyzer
             print(c("         Using PySpark parallel processing...", "magenta"))
+            logger.info(f"Using PySpark parallel processing for {len(all_markets)} markets")
             spark = SparkArbitrageAnalyzer()
             opportunities = spark.analyze_parallel(all_markets, detector)
             spark.stop()
-        except ImportError:
+            logger.info("PySpark analysis completed")
+        except ImportError as e:
+            logger.warning(f"PySpark not available: {e}")
             print(c("         Warning: pyspark not installed. Using sequential mode.", "yellow"))
             opportunities = detector.scan_all(all_markets)
     else:
         if use_spark and len(all_markets) < SPARK_MIN_MARKETS:
             print(c(f"         Skipping Spark (<{SPARK_MIN_MARKETS} markets). Using sequential.", "dim"))
+            logger.info(f"Market count ({len(all_markets)}) below Spark threshold ({SPARK_MIN_MARKETS}), using sequential mode")
+        logger.info(f"Scanning {len(all_markets)} markets sequentially")
         opportunities = detector.scan_all(all_markets)
 
     duration = time.time() - start
+    logger.info(f"Arbitrage detection completed in {duration:.2f}s, found {len(opportunities)} raw opportunities")
 
     # Filter by minimum display threshold
+    opportunities_before_filter = len(opportunities)
     opportunities = [
         o for o in opportunities
         if o.estimated_max_profit_usd >= MIN_DISPLAY_PROFIT_USD
     ]
+    filtered_count = opportunities_before_filter - len(opportunities)
+    if filtered_count > 0:
+        logger.info(f"Filtered out {filtered_count} opportunities below ${MIN_DISPLAY_PROFIT_USD} threshold")
 
     # Display results
     if not opportunities:
         print(c("\n  No arbitrage opportunities found above threshold.", "yellow"))
         print(f"  (min margin: ${min_margin}, min display: ${MIN_DISPLAY_PROFIT_USD})")
+        logger.info("No arbitrage opportunities found above display threshold")
     else:
         print(c(f"\n  Found {len(opportunities)} opportunities!", "green"))
+        logger.info(f"Found {len(opportunities)} arbitrage opportunities above threshold")
         for idx, opp in enumerate(opportunities):
             print_opportunity(opp, idx)
+            logger.debug(f"Opportunity #{idx+1}: {opp.arb_type.value} in market {opp.market.event_id}")
 
     print_summary(opportunities, duration)
+    logger.info("Scan completed successfully")
     return opportunities
 
 
@@ -267,14 +300,25 @@ def main():
     )
     parser.add_argument(
         "--verbose", "-v", action="store_true",
-        help="Enable verbose logging",
+        help="Enable verbose (DEBUG) logging",
+    )
+    parser.add_argument(
+        "--quiet", "-q", action="store_true",
+        help="Suppress INFO logs (only show warnings/errors)",
     )
     args = parser.parse_args()
 
-    log_level = logging.DEBUG if args.verbose else logging.WARNING
+    if args.verbose:
+        log_level = logging.DEBUG
+    elif args.quiet:
+        log_level = logging.WARNING
+    else:
+        log_level = logging.INFO
+
     logging.basicConfig(
         level=log_level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
     )
 
     try:
