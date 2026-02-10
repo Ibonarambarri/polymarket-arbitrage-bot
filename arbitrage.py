@@ -14,6 +14,8 @@ import logging
 from difflib import SequenceMatcher
 from typing import TYPE_CHECKING
 
+from tqdm import tqdm
+
 from config import MIN_PROFIT_MARGIN, MAX_CONDITION_PRICE, EMBEDDING_SIMILARITY_THRESHOLD
 from models import (
     Market,
@@ -178,7 +180,13 @@ class ArbitrageDetector:
         logger.info(f"Created {len(groups)} groups")
         total_pairs_checked = 0
 
-        for group_key, group in groups.items():
+        for group_key, group in tqdm(
+            groups.items(),
+            desc="         Analyzing groups",
+            unit="group",
+            leave=False,
+            disable=None,
+        ):
             if len(group) < 2:
                 continue
 

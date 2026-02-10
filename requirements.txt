@@ -2,12 +2,13 @@
 requests>=2.31.0
 tqdm>=4.65.0
 
-# LLM dependency detection (optional: --llm flag)
+# LLM dependency detection (Ollama local, enabled by default)
 openai>=1.12.0
 
-# Embeddings for topic classification (optional: --llm flag)
+# Embeddings for topic classification
 sentence-transformers>=2.3.0
 numpy>=1.24.0
+torch>=2.0.0
 
-# PySpark parallel processing (optional: --spark flag)
+# PySpark parallel processing
 pyspark>=3.5.0

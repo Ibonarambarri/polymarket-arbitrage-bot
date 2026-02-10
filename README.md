@@ -22,14 +22,10 @@ Entre mercados dependientes (mismo evento, misma fecha):
 - Pre-filtrado por topic con embeddings (Section 4.1.1)
 - Beneficio = diferencia de precios entre condiciones dependientes
 
-## Modos de Ejecucion
+## Requisitos
 
-| Modo | Comando | Descripcion |
-|------|---------|-------------|
-| Heuristico | `python main.py` | Rapido, usa similitud de texto |
-| LLM | `python main.py --llm` | Preciso, usa LLM para detectar dependencias logicas |
-| Spark | `python main.py --spark` | Escala, procesamiento paralelo con PySpark |
-| Full | `python main.py --llm --spark` | LLM + Spark combinados |
+- **Python 3.10+**
+- **Ollama** (para LLM local, activado por defecto): [ollama.com](https://ollama.com)
 
 ## Instalacion
 
@@ -40,46 +36,75 @@ cd polymarket-arbitrage-bot
 python -m venv venv
 source venv/bin/activate
 
-# Instalar todo
 pip install -r requirements.txt
-
-# O solo lo basico (sin LLM ni Spark)
-pip install requests
 ```
+
+### Instalar y arrancar Ollama
+
+```bash
+# macOS
+brew install ollama
+
+# Arrancar el servidor (dejar abierto)
+ollama serve
+```
+
+El modelo `deepseek-r1:latest` se descarga automaticamente en la primera ejecucion.
 
 ## Uso
 
 ```bash
-# Escaneo basico (solo requiere requests)
+# Modo por defecto: LLM local (Ollama + deepseek-r1) + Spark
 python main.py
+
+# Sin LLM, solo heuristico (mas rapido)
+python main.py --no-llm
+
+# Con otro modelo
+python main.py --llm-model qwen2.5:3b
 
 # Con precios en vivo del CLOB
 python main.py --refresh
 
-# Con LLM (requiere openai + sentence-transformers)
-python main.py --llm
+# Margen de beneficio personalizado
+python main.py --min-margin 0.05
 
-# Con LLM usando Ollama local
-python main.py --llm --llm-api-base http://localhost:11434/v1 --llm-model deepseek-r1:latest
+# Logging detallado
+python main.py -v
 
 # Con LLM usando OpenAI
-LLM_API_KEY=sk-... python main.py --llm --llm-api-base https://api.openai.com/v1 --llm-model gpt-4
+LLM_API_KEY=sk-... python main.py --llm-api-base https://api.openai.com/v1 --llm-model gpt-4
 
 # Con LLM usando DeepSeek API
-LLM_API_KEY=sk-... python main.py --llm --llm-api-base https://api.deepseek.com/v1 --llm-model deepseek-chat
-
-# Con PySpark (requiere pyspark)
-python main.py --spark
-
-# Modo completo
-python main.py --llm --spark --refresh --min-margin 0.05 -v
+LLM_API_KEY=sk-... python main.py --llm-api-base https://api.deepseek.com/v1 --llm-model deepseek-chat
 ```
+
+### Flags
+
+| Flag | Descripcion |
+|------|-------------|
+| `--no-llm` | Desactiva LLM, usa solo heuristico |
+| `--llm` | Fuerza LLM (activado por defecto) |
+| `--llm-model MODEL` | Modelo a usar (default: `deepseek-r1:latest`) |
+| `--llm-api-base URL` | URL de la API LLM (default: Ollama local) |
+| `--spark` | Fuerza PySpark (activado por defecto) |
+| `--refresh` | Precios en vivo del CLOB API |
+| `--min-margin N` | Margen minimo de beneficio (default: 0.02) |
+| `-v` / `--verbose` | Logging DEBUG |
+| `-q` / `--quiet` | Solo warnings/errors |
+
+### Comportamiento automatico
+
+- Si Ollama esta corriendo y el modelo esta disponible -> usa LLM
+- Si el modelo no esta descargado -> lo descarga automaticamente (auto-pull)
+- Si Ollama no esta corriendo -> fallback a modo heuristico con mensaje claro
+- Si hay 100+ mercados y PySpark esta instalado -> procesamiento paralelo
 
 ## Arquitectura
 
 ```
-polymarket_bot/
-├── main.py            # Entry point - CLI con flags --llm, --spark, --refresh
+polymarket-arbitrage-bot/
+├── main.py            # Entry point, CLI, check de Ollama
 ├── config.py          # Configuracion (API, LLM, embeddings, Spark)
 ├── models.py          # Modelos de datos (Market, Condition, Token, ArbitrageOpportunity)
 ├── fetcher.py         # Cliente API (Gamma API + CLOB API)
@@ -91,7 +116,7 @@ polymarket_bot/
 └── requirements.txt
 ```
 
-### Flujo de Deteccion Combinatorial (con --llm)
+### Flujo de Deteccion
 
 ```
 Markets -> [Embeddings: clasificar por topic]
@@ -101,6 +126,8 @@ Markets -> [Embeddings: clasificar por topic]
         -> [Validar output LLM: JSON valido, 1 True por mercado]
         -> [Calcular arbitraje en pares dependientes]
 ```
+
+Sin LLM, el flujo usa similitud de texto (`SequenceMatcher`) y agrupa solo por fecha.
 
 ## APIs Utilizadas
 
@@ -125,11 +152,14 @@ Parametros en `config.py`:
 
 | Parametro | Default | Descripcion |
 |-----------|---------|-------------|
-| `MIN_PROFIT_MARGIN` | 0.02 | Margen minimo para reportar oportunidad |
-| `MAX_CONDITION_PRICE` | 0.95 | Precio maximo para considerar condicion "incierta" |
-| `MAX_POSITION_SIZE` | 10000 | Tamano maximo de posicion para estimar beneficio |
-| `EMBEDDING_SIMILARITY_THRESHOLD` | 0.7 | Similitud minima para comprobar par con LLM |
-| `SPARK_MIN_MARKETS` | 100 | Minimo de mercados para justificar Spark |
+| `LLM_ENABLED` | `True` | LLM activado por defecto |
+| `LLM_TIMEOUT` | `120` | Timeout para modelos locales (segundos) |
+| `SPARK_ENABLED` | `True` | PySpark activado por defecto |
+| `MIN_PROFIT_MARGIN` | `0.02` | Margen minimo para reportar oportunidad |
+| `MAX_CONDITION_PRICE` | `0.95` | Precio maximo para considerar condicion "incierta" |
+| `MAX_POSITION_SIZE` | `10000` | Tamano maximo de posicion para estimar beneficio |
+| `EMBEDDING_SIMILARITY_THRESHOLD` | `0.7` | Similitud minima para comprobar par con LLM |
+| `SPARK_MIN_MARKETS` | `100` | Minimo de mercados para justificar Spark |
 
 ## Referencia
 

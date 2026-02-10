@@ -11,19 +11,31 @@ Detects three types of arbitrage:
   2. Market Rebalancing - sum of YES prices across a NegRisk market != $1
   3. Combinatorial      - pricing mismatch between dependent markets
 
+Uses a local LLM (Ollama + deepseek-r1) by default for dependency detection.
+Falls back to heuristic mode if Ollama is not available.
+
 Usage:
-  python main.py                     # Heuristic mode (fast)
-  python main.py --llm               # + LLM dependency detection (accurate)
+  python main.py                     # LLM mode (Ollama local, default)
+  python main.py --no-llm            # Heuristic mode only (no LLM)
+  python main.py --llm-model mistral # Use a different model
   python main.py --spark              # + PySpark parallel processing (scale)
-  python main.py --llm --spark        # Full power
   python main.py --refresh            # Live CLOB prices
   python main.py --min-margin 0.05    # Custom profit threshold
 """
 import argparse
+import json
 import logging
+import os
 import sys
 import time
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone
+
+# Prevent transformers from loading TensorFlow (not needed, avoids Keras version conflicts)
+os.environ.setdefault("USE_TF", "0")
+# Suppress tokenizers fork parallelism warning
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 from tqdm import tqdm
 
 from config import (
@@ -123,6 +135,79 @@ def print_summary(opportunities: list[ArbitrageOpportunity], duration: float):
 
 
 # ------------------------------------------------------------------ #
+#  Ollama availability check
+# ------------------------------------------------------------------ #
+
+def check_ollama(api_base: str, model: str) -> bool:
+    """Check that Ollama is running and the required model is available.
+
+    1. Pings Ollama's /api/tags endpoint.
+    2. If the model is not listed, attempts an auto-pull.
+    3. Returns True if ready, False otherwise.
+    """
+    # Derive Ollama host from the OpenAI-compat base URL (strip /v1 suffix)
+    host = api_base.rstrip("/")
+    if host.endswith("/v1"):
+        host = host[:-3]
+
+    # 1. Check Ollama is running
+    tags_url = f"{host}/api/tags"
+    try:
+        req = urllib.request.Request(tags_url, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
+        logger.warning(f"Ollama not reachable at {host}: {e}")
+        print(c(f"  Ollama is not running at {host}", "yellow"))
+        print(c("  Start it with: ollama serve", "yellow"))
+        return False
+
+    # 2. Check if the model is available
+    available_models = [m.get("name", "") for m in data.get("models", [])]
+    # Match with or without tag suffix (e.g. "deepseek-r1:latest" matches "deepseek-r1")
+    model_found = any(
+        m == model or m.startswith(model + ":") or model.startswith(m.split(":")[0] + ":")
+        for m in available_models
+    )
+
+    if model_found:
+        logger.info(f"Model '{model}' is available in Ollama")
+        return True
+
+    # 3. Auto-pull the model
+    print(c(f"  Model '{model}' not found locally. Pulling from Ollama registry...", "cyan"))
+    logger.info(f"Auto-pulling model '{model}' from Ollama")
+    pull_url = f"{host}/api/pull"
+    pull_body = json.dumps({"name": model}).encode()
+    try:
+        req = urllib.request.Request(
+            pull_url, data=pull_body, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            last_status = ""
+            for line in resp:
+                try:
+                    chunk = json.loads(line.decode().strip())
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                status = chunk.get("status", "")
+                if status != last_status:
+                    print(c(f"    {status}", "dim"))
+                    last_status = status
+                if chunk.get("error"):
+                    print(c(f"  Pull failed: {chunk['error']}", "yellow"))
+                    return False
+        print(c(f"  Model '{model}' pulled successfully.", "green"))
+        logger.info(f"Model '{model}' pulled successfully")
+        return True
+    except (urllib.error.URLError, OSError) as e:
+        logger.warning(f"Failed to pull model '{model}': {e}")
+        print(c(f"  Failed to pull model '{model}': {e}", "yellow"))
+        return False
+
+
+# ------------------------------------------------------------------ #
 #  Main scanner
 # ------------------------------------------------------------------ #
 
@@ -149,28 +234,34 @@ def scan(
     if use_llm:
         print(c("  [0/4] Initializing LLM + embeddings...", "cyan"))
         logger.info("Initializing LLM-based dependency detection")
-        try:
-            from llm_detector import LLMDependencyDetector
-            from embeddings import TopicClassifier
 
-            api_base = llm_api_base or LLM_API_BASE_URL
-            model = llm_model or LLM_MODEL
+        api_base = llm_api_base or LLM_API_BASE_URL
+        model = llm_model or LLM_MODEL
 
-            logger.info(f"Connecting to LLM API: {api_base}, model: {model}")
-            llm_detector = LLMDependencyDetector(
-                api_base_url=api_base,
-                api_key=LLM_API_KEY,
-                model_name=model,
-            )
-            logger.info("Loading topic classifier embeddings")
-            topic_classifier = TopicClassifier()
-            print(f"         LLM: {model} @ {api_base}")
-            print(f"         Embeddings: loaded")
-            logger.info("LLM initialization completed successfully")
-        except ImportError as e:
-            logger.warning(f"LLM dependencies not available: {e}")
-            print(c(f"         Warning: {e}. Install deps: pip install openai sentence-transformers", "yellow"))
+        if not check_ollama(api_base, model):
             print(c("         Falling back to heuristic mode.", "yellow"))
+            use_llm = False
+        else:
+            try:
+                from llm_detector import LLMDependencyDetector
+                from embeddings import TopicClassifier
+
+                logger.info(f"Connecting to LLM API: {api_base}, model: {model}")
+                llm_detector = LLMDependencyDetector(
+                    api_base_url=api_base,
+                    api_key=LLM_API_KEY,
+                    model_name=model,
+                )
+                logger.info("Loading topic classifier embeddings")
+                topic_classifier = TopicClassifier()
+                print(f"         LLM: {model} @ {api_base}")
+                print(f"         Embeddings: loaded")
+                logger.info("LLM initialization completed successfully")
+            except (ImportError, ValueError, OSError) as e:
+                logger.warning(f"LLM dependencies not available: {e}")
+                print(c(f"         Warning: {e}", "yellow"))
+                print(c("         Install deps: pip install openai sentence-transformers", "yellow"))
+                print(c("         Falling back to heuristic mode.", "yellow"))
 
     detector = ArbitrageDetector(
         min_margin=min_margin,
@@ -284,7 +375,11 @@ def main():
     )
     parser.add_argument(
         "--llm", action="store_true",
-        help="Enable LLM-based dependency detection (paper Section 5)",
+        help="Force enable LLM dependency detection (enabled by default via config)",
+    )
+    parser.add_argument(
+        "--no-llm", action="store_true",
+        help="Disable LLM dependency detection, use heuristic mode only",
     )
     parser.add_argument(
         "--spark", action="store_true",
@@ -325,7 +420,7 @@ def main():
         scan(
             refresh_prices=args.refresh,
             min_margin=args.min_margin,
-            use_llm=args.llm or LLM_ENABLED,
+            use_llm=not args.no_llm and (args.llm or LLM_ENABLED),
             use_spark=args.spark or SPARK_ENABLED,
             llm_api_base=args.llm_api_base,
             llm_model=args.llm_model,

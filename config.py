@@ -40,11 +40,11 @@ MIN_DISPLAY_PROFIT_USD = 1.0
 # --- LLM Configuration (Paper Sections 5.1, 5.2) ---
 # Set LLM_ENABLED=True and configure to use LLM-based dependency detection.
 # Works with any OpenAI-compatible API (Ollama, DeepSeek, OpenAI, etc.)
-LLM_ENABLED = False
+LLM_ENABLED = True
 LLM_API_BASE_URL = os.getenv("LLM_API_BASE_URL", "http://localhost:11434/v1")  # Ollama default
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-r1:latest")
-LLM_TIMEOUT = 60
+LLM_TIMEOUT = 120  # Local models are slower
 LLM_MAX_RETRIES = 3
 
 # Condition reduction: markets with >N conditions are reduced to top-N + "Other"
@@ -58,6 +58,6 @@ EMBEDDING_SIMILARITY_THRESHOLD = 0.7  # Min similarity to check pair with LLM
 
 # --- PySpark Configuration ---
 # Enable for parallel processing of large market datasets
-SPARK_ENABLED = False
+SPARK_ENABLED = True
 SPARK_MASTER = "local[*]"  # Or "spark://host:port" for cluster
 SPARK_MIN_MARKETS = 100  # Only use Spark above this threshold
