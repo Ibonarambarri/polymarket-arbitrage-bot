@@ -1,1 +1,12 @@
+# Core
 requests>=2.31.0
+
+# LLM dependency detection (optional: --llm flag)
+openai>=1.12.0
+
+# Embeddings for topic classification (optional: --llm flag)
+sentence-transformers>=2.3.0
+numpy>=1.24.0
+
+# PySpark parallel processing (optional: --spark flag)
+pyspark>=3.5.0

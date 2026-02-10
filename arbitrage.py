@@ -8,10 +8,13 @@ Implements the two types of arbitrage from the paper:
 Reference: "Unravelling the Probabilistic Forest: Arbitrage in Prediction Markets"
            Saguillo, Ghafouri, Kiffer, Suarez-Tangil (2025)
 """
+from __future__ import annotations
+
 import logging
 from difflib import SequenceMatcher
+from typing import TYPE_CHECKING
 
-from config import MIN_PROFIT_MARGIN, MAX_CONDITION_PRICE
+from config import MIN_PROFIT_MARGIN, MAX_CONDITION_PRICE, EMBEDDING_SIMILARITY_THRESHOLD
 from models import (
     Market,
     Condition,
@@ -19,14 +22,26 @@ from models import (
     ArbitrageType,
 )
 
+if TYPE_CHECKING:
+    from llm_detector import LLMDependencyDetector
+    from embeddings import TopicClassifier
+
 logger = logging.getLogger(__name__)
 
 
 class ArbitrageDetector:
     """Scans markets for arbitrage opportunities."""
 
-    def __init__(self, min_margin: float = MIN_PROFIT_MARGIN):
+    def __init__(
+        self,
+        min_margin: float = MIN_PROFIT_MARGIN,
+        llm_detector: LLMDependencyDetector | None = None,
+        topic_classifier: TopicClassifier | None = None,
+    ):
         self.min_margin = min_margin
+        self.llm_detector = llm_detector
+        self.topic_classifier = topic_classifier
+        self._checked_pairs: set[tuple[str, str]] = set()
 
     # ================================================================== #
     #  1. Single Condition Arbitrage (Section 6.1)
@@ -50,14 +65,12 @@ class ArbitrageDetector:
                 continue
 
             if spread < 1.0:
-                arb_type = ArbitrageType.SINGLE_CONDITION
                 profit = 1.0 - spread
                 detail = (
                     f"YES={condition.yes_price:.4f} + NO={condition.no_price:.4f} "
                     f"= {spread:.4f} < $1.00 | Buy both -> profit ${profit:.4f}/unit"
                 )
             else:
-                arb_type = ArbitrageType.SINGLE_CONDITION
                 profit = spread - 1.0
                 detail = (
                     f"YES={condition.yes_price:.4f} + NO={condition.no_price:.4f} "
@@ -65,7 +78,7 @@ class ArbitrageDetector:
                 )
 
             opportunities.append(ArbitrageOpportunity(
-                arb_type=arb_type,
+                arb_type=ArbitrageType.SINGLE_CONDITION,
                 market=market,
                 profit_per_dollar=profit,
                 details=detail,
@@ -137,43 +150,90 @@ class ArbitrageDetector:
         self, markets: list[Market], similarity_threshold: float = 0.5
     ) -> list[tuple[Market, Market, list[tuple[Condition, Condition]]]]:
         """
-        Find pairs of markets whose conditions are semantically dependent.
+        Find pairs of markets with dependent conditions.
 
-        The paper (Section 5) uses LLMs for this. We use a heuristic approach:
-        1. Same end date (Section 4.1.1: "markets relating to the same event
-           should share an end date")
-        2. Textual similarity between market questions
-        3. Condition-level matching for dependent subsets
+        Three modes (from most to least accurate):
+        1. LLM-based (paper Section 5): logical dependency via LLM reasoning
+        2. Embedding-based: topic + semantic similarity pre-filtering
+        3. Heuristic fallback: text similarity with SequenceMatcher
         """
         pairs = []
-        # Group by end date first (paper's filtering strategy)
-        by_date: dict[str, list[Market]] = {}
-        for m in markets:
-            date_key = m.end_date[:10] if m.end_date else "unknown"
-            by_date.setdefault(date_key, []).append(m)
+        self._checked_pairs.clear()
 
-        for date_key, group in by_date.items():
-            if date_key == "unknown" or len(group) < 2:
+        # Group markets by (topic, date) or just by date
+        if self.topic_classifier:
+            groups = self.topic_classifier.group_by_topic_and_date(markets)
+        else:
+            groups = self._group_by_date(markets)
+
+        for group_key, group in groups.items():
+            if len(group) < 2:
                 continue
 
             for i in range(len(group)):
                 for j in range(i + 1, len(group)):
                     m1, m2 = group[i], group[j]
-                    # Skip if same market
                     if m1.market_id == m2.market_id:
                         continue
 
-                    # Check textual similarity of questions
-                    sim = self._text_similarity(m1.question, m2.question)
-                    if sim < similarity_threshold:
+                    pair_key = tuple(sorted([m1.market_id, m2.market_id]))
+                    if pair_key in self._checked_pairs:
                         continue
+                    self._checked_pairs.add(pair_key)
 
-                    # Find dependent condition pairs
-                    dep_conditions = self._find_dependent_conditions(m1, m2)
+                    # Pre-filter: embedding similarity (if available)
+                    if self.topic_classifier:
+                        sim = self.topic_classifier.compute_similarity(m1, m2)
+                        if sim < EMBEDDING_SIMILARITY_THRESHOLD:
+                            continue
+
+                    # Check dependency: LLM or heuristic
+                    dep_conditions = self._check_pair_dependency(
+                        m1, m2, similarity_threshold
+                    )
                     if dep_conditions:
                         pairs.append((m1, m2, dep_conditions))
 
+        logger.info(f"Found {len(pairs)} dependent market pairs")
         return pairs
+
+    def _check_pair_dependency(
+        self,
+        m1: Market,
+        m2: Market,
+        similarity_threshold: float,
+    ) -> list[tuple[Condition, Condition]]:
+        """
+        Check if two markets are dependent using LLM (if available)
+        or fallback to heuristic text matching.
+        """
+        # Mode 1: LLM-based dependency detection (paper Section 5.2)
+        if self.llm_detector:
+            result = self.llm_detector.check_market_pair(m1, m2)
+            if result.is_dependent:
+                return self._extract_conditions_from_llm(result, m1, m2)
+            return []
+
+        # Mode 2: Heuristic fallback
+        sim = self._text_similarity(m1.question, m2.question)
+        if sim < similarity_threshold:
+            return []
+        return self._find_dependent_conditions_heuristic(m1, m2)
+
+    def _extract_conditions_from_llm(
+        self, result, m1: Market, m2: Market
+    ) -> list[tuple[Condition, Condition]]:
+        """Extract dependent condition pairs from LLM dependency result."""
+        deps = []
+        for m1_indices, m2_indices in result.dependent_subsets:
+            conds_m1 = self.llm_detector._reduce_conditions(m1)
+            conds_m2 = self.llm_detector._reduce_conditions(m2)
+            for i in m1_indices:
+                if i < len(conds_m1):
+                    for j in m2_indices:
+                        if j < len(conds_m2):
+                            deps.append((conds_m1[i], conds_m2[j]))
+        return deps
 
     def check_combinatorial_arbitrage(
         self,
@@ -193,13 +253,10 @@ class ArbitrageDetector:
             if not self._is_uncertain(c1) or not self._is_uncertain(c2):
                 continue
 
-            # The dependent conditions should have matching YES prices
             price_diff = abs(c1.yes_price - c2.yes_price)
-
             if price_diff < self.min_margin:
                 continue
 
-            # Determine direction
             if c1.yes_price < c2.yes_price:
                 detail = (
                     f"M1 '{c1.question}' YES={c1.yes_price:.4f} vs "
@@ -243,7 +300,6 @@ class ArbitrageDetector:
 
         # 3. Combinatorial arbitrage between dependent markets
         pairs = self.find_dependent_pairs(markets)
-        logger.info(f"Found {len(pairs)} potentially dependent market pairs")
         for m1, m2, deps in pairs:
             all_opps.extend(self.check_combinatorial_arbitrage(m1, m2, deps))
 
@@ -260,18 +316,27 @@ class ArbitrageDetector:
         return condition.yes_price <= MAX_CONDITION_PRICE
 
     @staticmethod
+    def _group_by_date(markets: list[Market]) -> dict[str, list[Market]]:
+        """Group markets by end date. Skip markets without dates."""
+        groups: dict[str, list[Market]] = {}
+        for m in markets:
+            if m.end_date:
+                key = m.end_date[:10]
+                groups.setdefault(key, []).append(m)
+        return groups
+
+    @staticmethod
     def _text_similarity(a: str, b: str) -> float:
         """Simple text similarity using SequenceMatcher."""
         return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
     @staticmethod
-    def _find_dependent_conditions(
+    def _find_dependent_conditions_heuristic(
         m1: Market, m2: Market
     ) -> list[tuple[Condition, Condition]]:
         """
-        Heuristic: match conditions between markets by question similarity.
-        Two conditions are considered dependent if they ask semantically
-        similar questions (e.g., "Will Team A win?" in both markets).
+        Heuristic fallback: match conditions by question text similarity.
+        Used when no LLM is configured.
         """
         deps = []
         for c1 in m1.conditions:

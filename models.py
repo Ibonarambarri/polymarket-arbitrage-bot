@@ -97,4 +97,5 @@ class ArbitrageOpportunity:
     @property
     def estimated_max_profit_usd(self) -> float:
         """Estimated profit based on available liquidity."""
-        return abs(self.profit_per_dollar) * min(self.market.liquidity, 10000)
+        from config import MAX_POSITION_SIZE
+        return abs(self.profit_per_dollar) * min(self.market.liquidity, MAX_POSITION_SIZE)

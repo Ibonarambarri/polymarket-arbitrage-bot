@@ -156,7 +156,8 @@ class PolymarketFetcher:
         if not clob_token_ids or not outcomes:
             return None
 
-        tokens = []
+        # Map by outcome name (not index) to avoid YES/NO price swaps
+        outcome_map: dict[str, tuple[str, float]] = {}
         for i, outcome in enumerate(outcomes):
             price = 0.0
             if i < len(outcome_prices) and outcome_prices[i]:
@@ -165,6 +166,11 @@ class PolymarketFetcher:
                 except (ValueError, TypeError):
                     pass
             token_id = clob_token_ids[i] if i < len(clob_token_ids) else ""
+            outcome_map[outcome] = (token_id, price)
+
+        tokens = []
+        for outcome in ["Yes", "No"]:
+            token_id, price = outcome_map.get(outcome, ("", 0.0))
             tokens.append(Token(token_id=token_id, outcome=outcome, price=price))
 
         return Condition(

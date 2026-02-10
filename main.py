@@ -12,9 +12,12 @@ Detects three types of arbitrage:
   3. Combinatorial      - pricing mismatch between dependent markets
 
 Usage:
-  python main.py                  # Scan all active markets
-  python main.py --refresh        # Also refresh live prices from CLOB
-  python main.py --min-margin 0.03  # Set custom minimum profit margin
+  python main.py                     # Heuristic mode (fast)
+  python main.py --llm               # + LLM dependency detection (accurate)
+  python main.py --spark              # + PySpark parallel processing (scale)
+  python main.py --llm --spark        # Full power
+  python main.py --refresh            # Live CLOB prices
+  python main.py --min-margin 0.05    # Custom profit threshold
 """
 import argparse
 import logging
@@ -22,7 +25,16 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from config import MIN_PROFIT_MARGIN, MIN_DISPLAY_PROFIT_USD
+from config import (
+    MIN_PROFIT_MARGIN,
+    MIN_DISPLAY_PROFIT_USD,
+    LLM_ENABLED,
+    LLM_API_BASE_URL,
+    LLM_API_KEY,
+    LLM_MODEL,
+    SPARK_ENABLED,
+    SPARK_MIN_MARKETS,
+)
 from models import ArbitrageOpportunity, ArbitrageType
 from fetcher import PolymarketFetcher
 from arbitrage import ArbitrageDetector
@@ -47,11 +59,18 @@ def c(text: str, color: str) -> str:
     return f"{COLORS.get(color, '')}{text}{COLORS['reset']}"
 
 
-def print_header():
+def print_header(use_llm: bool, use_spark: bool):
     print()
     print(c("=" * 70, "cyan"))
     print(c("  POLYMARKET ARBITRAGE SCANNER", "bold"))
     print(c("  Based on: 'Unravelling the Probabilistic Forest' (2025)", "dim"))
+    modes = []
+    if use_llm:
+        modes.append("LLM")
+    if use_spark:
+        modes.append("Spark")
+    if modes:
+        print(c(f"  Mode: {' + '.join(modes)}", "magenta"))
     print(c("=" * 70, "cyan"))
     print()
 
@@ -103,11 +122,48 @@ def print_summary(opportunities: list[ArbitrageOpportunity], duration: float):
 #  Main scanner
 # ------------------------------------------------------------------ #
 
-def scan(refresh_prices: bool = False, min_margin: float = MIN_PROFIT_MARGIN):
-    print_header()
+def scan(
+    refresh_prices: bool = False,
+    min_margin: float = MIN_PROFIT_MARGIN,
+    use_llm: bool = False,
+    use_spark: bool = False,
+    llm_api_base: str | None = None,
+    llm_model: str | None = None,
+):
+    print_header(use_llm, use_spark)
 
     fetcher = PolymarketFetcher()
-    detector = ArbitrageDetector(min_margin=min_margin)
+
+    # Initialize optional components
+    llm_detector = None
+    topic_classifier = None
+
+    if use_llm:
+        print(c("  [0/4] Initializing LLM + embeddings...", "cyan"))
+        try:
+            from llm_detector import LLMDependencyDetector
+            from embeddings import TopicClassifier
+
+            api_base = llm_api_base or LLM_API_BASE_URL
+            model = llm_model or LLM_MODEL
+
+            llm_detector = LLMDependencyDetector(
+                api_base_url=api_base,
+                api_key=LLM_API_KEY,
+                model_name=model,
+            )
+            topic_classifier = TopicClassifier()
+            print(f"         LLM: {model} @ {api_base}")
+            print(f"         Embeddings: loaded")
+        except ImportError as e:
+            print(c(f"         Warning: {e}. Install deps: pip install openai sentence-transformers", "yellow"))
+            print(c("         Falling back to heuristic mode.", "yellow"))
+
+    detector = ArbitrageDetector(
+        min_margin=min_margin,
+        llm_detector=llm_detector,
+        topic_classifier=topic_classifier,
+    )
 
     # 1. Fetch all active events
     print(c("  [1/4] Fetching active events from Polymarket...", "cyan"))
@@ -140,7 +196,22 @@ def scan(refresh_prices: bool = False, min_margin: float = MIN_PROFIT_MARGIN):
     # 4. Detect arbitrage
     print(c("  [4/4] Scanning for arbitrage opportunities...", "cyan"))
     start = time.time()
-    opportunities = detector.scan_all(all_markets)
+
+    if use_spark and len(all_markets) >= SPARK_MIN_MARKETS:
+        try:
+            from spark_analyzer import SparkArbitrageAnalyzer
+            print(c("         Using PySpark parallel processing...", "magenta"))
+            spark = SparkArbitrageAnalyzer()
+            opportunities = spark.analyze_parallel(all_markets, detector)
+            spark.stop()
+        except ImportError:
+            print(c("         Warning: pyspark not installed. Using sequential mode.", "yellow"))
+            opportunities = detector.scan_all(all_markets)
+    else:
+        if use_spark and len(all_markets) < SPARK_MIN_MARKETS:
+            print(c(f"         Skipping Spark (<{SPARK_MIN_MARKETS} markets). Using sequential.", "dim"))
+        opportunities = detector.scan_all(all_markets)
+
     duration = time.time() - start
 
     # Filter by minimum display threshold
@@ -179,6 +250,22 @@ def main():
         help=f"Minimum profit margin to report (default: {MIN_PROFIT_MARGIN})",
     )
     parser.add_argument(
+        "--llm", action="store_true",
+        help="Enable LLM-based dependency detection (paper Section 5)",
+    )
+    parser.add_argument(
+        "--spark", action="store_true",
+        help="Use PySpark for parallel processing",
+    )
+    parser.add_argument(
+        "--llm-api-base", type=str, default=None,
+        help="LLM API base URL (overrides config/env)",
+    )
+    parser.add_argument(
+        "--llm-model", type=str, default=None,
+        help="LLM model name (overrides config/env)",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Enable verbose logging",
     )
@@ -191,7 +278,14 @@ def main():
     )
 
     try:
-        scan(refresh_prices=args.refresh, min_margin=args.min_margin)
+        scan(
+            refresh_prices=args.refresh,
+            min_margin=args.min_margin,
+            use_llm=args.llm or LLM_ENABLED,
+            use_spark=args.spark or SPARK_ENABLED,
+            llm_api_base=args.llm_api_base,
+            llm_model=args.llm_model,
+        )
     except KeyboardInterrupt:
         print(c("\n\n  Scan interrupted by user.", "yellow"))
         sys.exit(0)
